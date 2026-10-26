@@ -3,7 +3,7 @@
  * @author ce017
  * @authorLink https://github.com/ce017
  * @description Equip any avatar decoration, profile effect, nameplate, profile frame and badge (at any level) on your own profile, straight from Discord's shop catalog. Client-side only: nobody else can see it.
- * @version 1.0.0
+ * @version 1.0.1
  * @source https://github.com/ce017/NitroSimulator
  * @updateUrl https://raw.githubusercontent.com/ce017/NitroSimulator/main/NitroSimulator.plugin.js
  */
@@ -15,14 +15,20 @@ const h = React.createElement;
 
 const UserStore = Webpack.getStore("UserStore");
 const UserProfileStore = Webpack.getStore("UserProfileStore");
-const BadgeDirectoryStore = Webpack.getStore("BadgeDirectoryStore");
-const CollectiblesCategoryStore = Webpack.getStore("CollectiblesCategoryStore");
 
+// Several of these live in chunks Discord only loads on demand (the profile editor, the shop, the badge directory),
+// so they are looked up when first needed and cached once found.
+function lazy(find) {
+    let value;
+    return () => value ?? (value = find());
+}
 const findFunction = (...strings) => Webpack.getModule(Filters.byStrings(...strings), { searchExports: true });
-const fetchShopCatalog = findFunction("COLLECTIBLES_CATEGORIES_FETCH", "COLLECTIBLES_CATEGORIES_V2");
-const fetchBadgeCatalog = findFunction("BADGE_DIRECTORY_FETCH_START");
-const ProfileFrame = findFunction("filterLayer", "profileFrameClassName");
-const editorClasses = Webpack.getByKeys("editingPanel", "profileContentOuter");
+const getBadgeDirectoryStore = lazy(() => Webpack.getStore("BadgeDirectoryStore"));
+const getCollectiblesStore = lazy(() => Webpack.getStore("CollectiblesCategoryStore"));
+const getFetchShopCatalog = lazy(() => findFunction("COLLECTIBLES_CATEGORIES_FETCH", "COLLECTIBLES_CATEGORIES_V2"));
+const getFetchBadgeCatalog = lazy(() => findFunction("BADGE_DIRECTORY_FETCH_START"));
+const getProfileFrame = lazy(() => findFunction("filterLayer", "profileFrameClassName"));
+const editorClassesFilter = Filters.byKeys("editingPanel", "profileContentOuter");
 
 // Discord's badge type enum ({ PREMIUM_TENURE: 1, ..., STAFF: 22 }), with a copy as fallback.
 const BadgeType = Webpack.getModule(m => m?.PREMIUM_TENURE === 1 && m?.GUILD_BOOSTER === 12, { searchExports: true }) ?? {
@@ -132,12 +138,29 @@ module.exports = class NitroSimulator {
         DOM.addStyle(STYLES);
         this.patchUsers();
         this.patchProfiles();
-        this.patchBadgeDirectory();
         this.refresh();
-        this.injectIntoProfileEditor();
+
+        this.abort = new AbortController();
+        const { signal } = this.abort;
+        this.waitFor(Filters.byStoreName("BadgeDirectoryStore"), signal, store => {
+            this.patchBadgeDirectory(store);
+            store.emitChange();
+        });
+        this.waitFor(editorClassesFilter, signal, classes => {
+            this.editorClasses = classes;
+            this.injectIntoProfileEditor();
+        });
+    }
+
+    // Runs `then` with the module as soon as Discord loads it (straight away if it already has).
+    waitFor(filter, signal, then) {
+        Webpack.waitForModule(filter, { signal })
+            .then(module => { if (module && !signal.aborted) then(module); })
+            .catch(err => { if (!signal.aborted) console.error(`[${PLUGIN}]`, err); });
     }
 
     stop() {
+        this.abort?.abort();
         Patcher.unpatchAll();
         DOM.removeStyle();
         document.querySelectorAll(".ns-section").forEach(el => el.remove());
@@ -147,7 +170,7 @@ module.exports = class NitroSimulator {
 
     // The editor panel's groups render after the panel itself, so check again once per frame while the DOM changes.
     observer() {
-        if (!editorClasses || this.injectQueued) return;
+        if (!this.editorClasses || this.injectQueued) return;
         this.injectQueued = true;
         requestAnimationFrame(() => {
             this.injectQueued = false;
@@ -174,7 +197,7 @@ module.exports = class NitroSimulator {
     }
 
     emitStoreChanges() {
-        for (const store of [UserStore, UserProfileStore, BadgeDirectoryStore]) {
+        for (const store of [UserStore, UserProfileStore, getBadgeDirectoryStore()]) {
             try { store?.emitChange(); } catch (err) { console.error(`[${PLUGIN}]`, err); }
         }
     }
@@ -240,8 +263,7 @@ module.exports = class NitroSimulator {
     }
 
     // Discord's badge directory (click a badge on your profile) shows equipped badges as owned, at the chosen level.
-    patchBadgeDirectory() {
-        if (!BadgeDirectoryStore) return;
+    patchBadgeDirectory(BadgeDirectoryStore) {
         const dress = (badge, userId) => {
             if (!badge || this.readingCatalog || (userId ?? this.currentUserId) !== this.currentUserId) return badge;
             const equipped = this.settings.badges.find(b => b.badgeId === badge.badge_id);
@@ -255,15 +277,15 @@ module.exports = class NitroSimulator {
     // Unpatched view of the badge catalog, for the picker.
     getBadgeCatalog() {
         this.readingCatalog = true;
-        try { return BadgeDirectoryStore?.getBadges(this.currentUserId) ?? []; }
+        try { return getBadgeDirectoryStore()?.getBadges(this.currentUserId) ?? []; }
         finally { this.readingCatalog = false; }
     }
 
     // ---- profile editor section ----
 
     injectIntoProfileEditor() {
-        if (!editorClasses) return;
-        for (const panel of document.querySelectorAll(`.${editorClasses.editingPanel}`)) {
+        if (!this.editorClasses) return;
+        for (const panel of document.querySelectorAll(`.${this.editorClasses.editingPanel}`)) {
             if (panel.querySelector(".ns-section")) continue;
             const headings = panel.querySelectorAll("h3");
             const lastGroup = headings[headings.length - 1]?.parentElement;
@@ -308,10 +330,12 @@ function useStore(store, read) {
 }
 
 function useShopItems(type) {
-    const products = useStore(CollectiblesCategoryStore, () => CollectiblesCategoryStore.products);
+    const store = getCollectiblesStore();
+    const products = useStore(store, () => store?.products);
     const [loading, setLoading] = React.useState(false);
 
     React.useEffect(() => {
+        const fetchShopCatalog = getFetchShopCatalog();
         if (products?.size || !fetchShopCatalog) return;
         setLoading(true);
         Promise.resolve(fetchShopCatalog()).catch(err => console.error(`[${PLUGIN}]`, err)).finally(() => setLoading(false));
@@ -336,10 +360,11 @@ function useShopItems(type) {
 }
 
 function useBadgeCatalog(plugin) {
-    const badges = useStore(BadgeDirectoryStore, () => plugin.getBadgeCatalog());
+    const badges = useStore(getBadgeDirectoryStore(), () => plugin.getBadgeCatalog());
     const [loading, setLoading] = React.useState(false);
 
     React.useEffect(() => {
+        const fetchBadgeCatalog = getFetchBadgeCatalog();
         if (badges.length || !fetchBadgeCatalog) return;
         setLoading(true);
         Promise.resolve(fetchBadgeCatalog()).catch(err => console.error(`[${PLUGIN}]`, err)).finally(() => setLoading(false));
@@ -447,6 +472,7 @@ function Preview({ slot, item }) {
 }
 
 function FramePreview({ item }) {
+    const ProfileFrame = getProfileFrame();
     if (!ProfileFrame) return h("div", { className: "ns-none" }, item.name);
     return h(Components.ErrorBoundary, { fallback: h("div", { className: "ns-none" }, item.name) },
         h("div", { className: "ns-frame" },
