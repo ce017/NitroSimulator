@@ -2,8 +2,8 @@
  * @name NitroSimulator
  * @author ce017
  * @authorLink https://github.com/ce017
- * @description Equip any avatar decoration, profile effect, nameplate, profile frame and badge (at any level) on your own profile, straight from Discord's shop catalog. Client-side only: nobody else can see it.
- * @version 1.0.1
+ * @description Equip any avatar decoration, profile effect, nameplate, profile frame, banner, display name style and badge (at any level, in any order) on your own profile, straight from Discord's own catalog. Client-side only: nobody else can see it.
+ * @version 1.1.0
  * @source https://github.com/ce017/NitroSimulator
  * @updateUrl https://raw.githubusercontent.com/ce017/NitroSimulator/main/NitroSimulator.plugin.js
  */
@@ -28,7 +28,30 @@ const getCollectiblesStore = lazy(() => Webpack.getStore("CollectiblesCategorySt
 const getFetchShopCatalog = lazy(() => findFunction("COLLECTIBLES_CATEGORIES_FETCH", "COLLECTIBLES_CATEGORIES_V2"));
 const getFetchBadgeCatalog = lazy(() => findFunction("BADGE_DIRECTORY_FETCH_START"));
 const getProfileFrame = lazy(() => findFunction("filterLayer", "profileFrameClassName"));
+const getFetchProfile = lazy(() => findFunction("USER_PROFILE_FETCH_START", "withMutualFriends"));
 const editorClassesFilter = Filters.byKeys("editingPanel", "profileContentOuter");
+
+// Display name styles: Discord's font/effect enums, its preset colour palettes and the component that draws a styled name.
+const unwrapComponent = m => m?.render ?? m?.type?.render ?? m?.type ?? m;
+const getNameFonts = lazy(() => Webpack.getModule(m => m?.CHERRY_BOMB !== undefined && m?.HEXAGON !== undefined, { searchExports: true }));
+const getNameEffects = lazy(() => Webpack.getModule(m => m?.GRADIENT === 2 && m?.GUMMY !== undefined, { searchExports: true }));
+const getNameFontInfo = lazy(() => {
+    const mod = Webpack.getBySource("useDisplayNameStylesFont");
+    return mod && Object.values(mod).find(f => typeof f === "function" && f.toString().includes("className:"));
+});
+const getNamePalettes = lazy(() => {
+    const mod = Webpack.getBySource("2417517");
+    return mod && Object.values(mod).find(f => typeof f === "function" && f.length === 1 && f.toString().includes("switch"));
+});
+const getStyledName = lazy(() => Webpack.getModule(m => {
+    const f = unwrapComponent(m);
+    return typeof f === "function" && f.toString().includes("data-username-with-effects");
+}, { searchExports: true }));
+const getNameDisplayType = lazy(() => Webpack.getModule(m => m?.ANIMATED !== undefined && m?.PLAIN !== undefined && m?.STATIC !== undefined, { searchExports: true }));
+
+// Stands in for a banner hash on your profile; the banner URL builder swaps it for your picked image.
+const BANNER_SENTINEL = "ns_banner";
+const MAX_BANNER_FILE = 10 * 1024 * 1024;
 
 // Discord's badge type enum ({ PREMIUM_TENURE: 1, ..., STAFF: 22 }), with a copy as fallback.
 const BadgeType = Webpack.getModule(m => m?.PREMIUM_TENURE === 1 && m?.GUILD_BOOSTER === 12, { searchExports: true }) ?? {
@@ -59,10 +82,15 @@ const TABS = [
     { id: "effect", label: "Profile Effects", type: CollectibleType.EFFECT },
     { id: "nameplate", label: "Nameplates", type: CollectibleType.NAMEPLATE },
     { id: "frame", label: "Profile Frames", type: CollectibleType.FRAME },
+    { id: "banner", label: "Banner" },
+    { id: "nameStyle", label: "Name Style" },
     { id: "badges", label: "Badges" }
 ];
 
-const DEFAULT_SETTINGS = { decoration: null, effect: null, nameplate: null, frame: null, badges: [], keepRealBadges: true };
+const DEFAULT_SETTINGS = {
+    decoration: null, effect: null, nameplate: null, frame: null, banner: null, nameStyle: null,
+    badges: [], keepRealBadges: true, badgeOrder: null
+};
 
 const decorationUrl = (asset, animated) => `https://cdn.discordapp.com/avatar-decoration-presets/${asset}.png?size=160&passthrough=${animated}`;
 const nameplateUrl = (asset, animated) => `https://cdn.discordapp.com/assets/collectibles/${asset}${animated ? "asset.webm" : "static.png"}`;
@@ -114,13 +142,34 @@ function cloneWith(source, overrides) {
     return clone;
 }
 
-function sortBadges(badges) {
+// Identifies a badge for ordering, so a Nitro badge keeps its place whichever level it is.
+function badgeKey(badge) {
+    return String(badgeTypeOf(badge.id) ?? badge.id);
+}
+
+// Your custom order first (if any), then Discord's usual order for anything not in it.
+function sortBadges(badges, customOrder) {
     const rank = b => {
+        const custom = customOrder?.indexOf(badgeKey(b)) ?? -1;
+        if (custom !== -1) return custom;
         const i = BADGE_ORDER.indexOf(badgeTypeOf(b.id));
-        return i === -1 ? BADGE_ORDER.length : i;
+        return (customOrder?.length ?? 0) + (i === -1 ? BADGE_ORDER.length : i);
     };
     return [...badges].sort((a, b) => rank(a) - rank(b));
 }
+
+function readFileAsDataUrl(file) {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+}
+
+const hexToInt = hex => parseInt(hex.slice(1), 16);
+const intToHex = n => `#${(n >>> 0).toString(16).padStart(6, "0").slice(-6)}`;
+const titleCase = key => key.toLowerCase().split("_").map(w => w[0].toUpperCase() + w.slice(1)).join(" ");
 
 module.exports = class NitroSimulator {
     constructor() {
@@ -150,6 +199,7 @@ module.exports = class NitroSimulator {
             this.editorClasses = classes;
             this.injectIntoProfileEditor();
         });
+        this.waitFor(Filters.bySource("/banners/${"), signal, module => this.patchBannerUrl(module));
     }
 
     // Runs `then` with the module as soon as Discord loads it (straight away if it already has).
@@ -218,8 +268,8 @@ module.exports = class NitroSimulator {
     }
 
     dressUser(user) {
-        const { decoration, nameplate } = this.settings;
-        if (!user || user.id !== this.currentUserId || (!decoration && !nameplate)) return user;
+        const { decoration, nameplate, nameStyle } = this.settings;
+        if (!user || user.id !== this.currentUserId || (!decoration && !nameplate && !nameStyle)) return user;
 
         const cached = this.userClones.get(user);
         if (cached?.revision === this.revision) return cached.clone;
@@ -232,6 +282,7 @@ module.exports = class NitroSimulator {
                 nameplate: { skuId: nameplate.skuId, asset: nameplate.asset, label: nameplate.label, palette: nameplate.palette, expiresAt: null }
             };
         }
+        if (nameStyle) overrides.displayNameStyles = { fontId: nameStyle.fontId, effectId: nameStyle.effectId, colors: nameStyle.colors };
         const clone = cloneWith(user, overrides);
         this.userClones.set(user, { revision: this.revision, clone });
         return clone;
@@ -245,21 +296,37 @@ module.exports = class NitroSimulator {
     }
 
     dressProfile(profile) {
-        const { effect, frame, badges, keepRealBadges } = this.settings;
-        if (!effect && !frame && !badges.length && keepRealBadges) return profile;
+        const { effect, frame, banner, badges, keepRealBadges, badgeOrder } = this.settings;
+        if (!effect && !frame && !banner && !badges.length && keepRealBadges && !badgeOrder) return profile;
 
         const cached = this.profileClones.get(profile);
         if (cached?.revision === this.revision) return cached.clone;
 
         const equippedTypes = new Set(badges.map(b => b.badgeId));
         const real = keepRealBadges ? (profile.badges ?? []).filter(b => !equippedTypes.has(badgeTypeOf(b.id))) : [];
-        const overrides = { badges: sortBadges([...real, ...badges.map(b => b.profile)]) };
+        const overrides = { badges: sortBadges([...real, ...badges.map(b => b.profile)], badgeOrder) };
         if (effect) overrides.profileEffect = { skuId: effect.skuId, expiresAt: null };
         if (frame) overrides.profileFrame = { skuId: frame.skuId, expiresAt: null };
+        // Discord only draws banner images for Nitro profiles, so the profile also reports Nitro while a banner is picked.
+        if (banner) {
+            overrides.banner = BANNER_SENTINEL;
+            overrides.premiumType = Math.max(profile.premiumType ?? 0, 2);
+        }
 
         const clone = cloneWith(profile, overrides);
         this.profileClones.set(profile, { revision: this.revision, clone });
         return clone;
+    }
+
+    // Discord builds banner URLs from the profile's banner hash; for our stand-in hash it gets the picked image instead.
+    patchBannerUrl(module) {
+        const key = Object.keys(module).find(k => typeof module[k] === "function" && module[k].toString().includes("/banners/"));
+        if (!key) return;
+        Patcher.after(module, key, (_, [args], url) => {
+            if (args?.banner !== BANNER_SENTINEL) return url;
+            return this.settings.banner?.url ?? url;
+        });
+        UserProfileStore.emitChange();
     }
 
     // Discord's badge directory (click a badge on your profile) shows equipped badges as owned, at the chosen level.
@@ -388,9 +455,148 @@ function Picker({ plugin, initialTab = "decoration" }) {
                 onClick: () => setTab(t.id)
             }, t.label))
         ),
-        tab === "badges"
-            ? h(BadgePicker, { plugin })
+        tab === "badges" ? h(BadgePicker, { plugin })
+            : tab === "banner" ? h(BannerPicker, { plugin })
+            : tab === "nameStyle" ? h(NameStylePicker, { plugin })
             : h(CollectiblePicker, { key: tab, plugin, slot: tab, type: current.type })
+    );
+}
+
+function BannerPicker({ plugin }) {
+    const settings = useSettings(plugin);
+    const [url, setUrl] = React.useState("");
+    const [error, setError] = React.useState(null);
+    const fileInput = React.useRef(null);
+    const banner = settings.banner;
+
+    // Load the image first so a broken link never ends up on the profile.
+    const tryImage = (src, name) => new Promise(resolve => {
+        const img = new Image();
+        img.onload = () => resolve(true);
+        img.onerror = () => resolve(false);
+        img.src = src;
+    }).then(ok => {
+        if (!ok) return setError("That image couldn't be loaded. Use a direct link to a PNG, JPG, GIF or WebP.");
+        setError(null);
+        plugin.update({ banner: { url: src, name } });
+    });
+
+    const onFile = async e => {
+        const file = e.target.files?.[0];
+        e.target.value = "";
+        if (!file) return;
+        if (!file.type.startsWith("image/")) return setError("Pick an image file.");
+        if (file.size > MAX_BANNER_FILE) return setError("That file is over 10 MB. Pick a smaller one.");
+        tryImage(await readFileAsDataUrl(file), file.name);
+    };
+
+    return h("div", { className: "ns-banner" },
+        h("div", { className: "ns-banner-preview" },
+            banner ? h("img", { src: banner.url, alt: "" }) : h("span", null, "No banner picked: your real one shows.")
+        ),
+        h("div", { className: "ns-banner-row" },
+            h("input", {
+                className: "ns-search",
+                placeholder: "Paste an image or GIF link",
+                value: url,
+                onChange: e => setUrl(e.target.value),
+                onKeyDown: e => { if (e.key === "Enter" && url.trim()) tryImage(url.trim(), url.trim()); }
+            }),
+            h("button", { className: "ns-button", disabled: !url.trim(), onClick: () => tryImage(url.trim(), url.trim()) }, "Use link")
+        ),
+        h("div", { className: "ns-banner-row" },
+            h("button", { className: "ns-button", onClick: () => fileInput.current?.click() }, "Upload from computer"),
+            banner && h("button", { className: "ns-button ns-secondary", onClick: () => plugin.update({ banner: null }) }, "Remove"),
+            h("input", { ref: fileInput, type: "file", accept: "image/*", hidden: true, onChange: onFile })
+        ),
+        error && h("div", { className: "ns-error" }, error),
+        h("div", { className: "ns-note" }, "Animated GIFs work. Discord shows banners at about 5:2, so wide images look best.")
+    );
+}
+
+const EFFECT_ORDER = ["SOLID", "GRADIENT", "NEON", "TOON", "POP", "GLOW", "PRISM", "GUMMY"];
+
+function NameStylePicker({ plugin }) {
+    const settings = useSettings(plugin);
+    const fonts = getNameFonts();
+    const effects = getNameEffects();
+    const fontInfo = getNameFontInfo();
+    const palettesFor = getNamePalettes();
+    const me = UserStore.getCurrentUser();
+
+    if (!fonts || !effects) {
+        return h("div", { className: "ns-empty" }, "Discord's name styles aren't available in this client yet.");
+    }
+
+    const style = settings.nameStyle ?? { fontId: fonts.DEFAULT, effectId: effects.SOLID, colors: [0xffffff] };
+    const palettes = (() => {
+        try { return palettesFor?.(style.effectId) ?? [[0xffffff]]; }
+        catch { return [[0xffffff]]; }
+    })();
+    const set = changes => plugin.update({ nameStyle: { ...style, ...changes } });
+
+    // Fonts without a class name aren't loaded by this Discord build, so they'd fall back to the normal font.
+    const fontList = Object.keys(fonts).filter(k => isNaN(k)).filter(k => k === "DEFAULT" || fontInfo?.(fonts[k])?.className);
+    const effectList = EFFECT_ORDER.filter(k => effects[k] !== undefined);
+
+    const pickEffect = key => {
+        const next = effects[key];
+        let preset = [[0xffffff]];
+        try { preset = palettesFor?.(next) ?? preset; } catch {}
+        set({ effectId: next, colors: [...preset[0]] });
+    };
+
+    return h("div", { className: "ns-namestyle" },
+        h("div", { className: "ns-name-preview" },
+            h(StyledName, { name: me?.globalName ?? me?.username ?? "You", style }),
+            settings.nameStyle && h("button", { className: "ns-button ns-secondary", onClick: () => plugin.update({ nameStyle: null }) }, "Use my real one")
+        ),
+        h("div", { className: "ns-heading" }, "Font"),
+        h("div", { className: "ns-chips" },
+            fontList.map(key => h("button", {
+                key,
+                className: `ns-chip ${style.fontId === fonts[key] ? "ns-active" : ""}`,
+                onClick: () => set({ fontId: fonts[key] })
+            }, h("span", { className: fontInfo?.(fonts[key])?.className }, key === "DEFAULT" ? "Default" : titleCase(key))))
+        ),
+        h("div", { className: "ns-heading" }, "Effect"),
+        h("div", { className: "ns-chips" },
+            effectList.map(key => h("button", {
+                key,
+                className: `ns-chip ${style.effectId === effects[key] ? "ns-active" : ""}`,
+                onClick: () => pickEffect(key)
+            }, titleCase(key)))
+        ),
+        h("div", { className: "ns-heading" }, "Colours"),
+        h("div", { className: "ns-chips" },
+            palettes.map((colors, i) => h("button", {
+                key: i,
+                className: `ns-swatch ${colors.join() === style.colors.join() ? "ns-active" : ""}`,
+                style: { background: colors.length > 1 ? `linear-gradient(90deg, ${colors.map(intToHex).join(", ")})` : intToHex(colors[0]) },
+                onClick: () => set({ colors: [...colors] }),
+                title: colors.map(intToHex).join(" ")
+            }))
+        ),
+        h("div", { className: "ns-chips" },
+            style.colors.map((color, i) => h("label", { key: i, className: "ns-color" },
+                h("input", {
+                    type: "color",
+                    value: intToHex(color),
+                    onChange: e => set({ colors: style.colors.map((c, j) => j === i ? hexToInt(e.target.value) : c) })
+                }),
+                style.colors.length > 1 ? `Colour ${i + 1}` : "Custom colour"
+            ))
+        )
+    );
+}
+
+// Discord's own styled-name component, so the preview matches what the profile shows.
+function StyledName({ name, style }) {
+    const Component = getStyledName();
+    const displayType = getNameDisplayType();
+    if (!Component) return h("span", { className: "ns-name-fallback" }, name);
+    return h(Components.ErrorBoundary, { fallback: h("span", { className: "ns-name-fallback" }, name) },
+        h(Component, { userName: name, displayNameStyles: style, effectDisplayType: displayType?.ANIMATED ?? 2, inProfile: true, loop: true })
     );
 }
 
@@ -493,6 +699,7 @@ function BadgePicker({ plugin }) {
     };
 
     return h("div", null,
+        h(BadgeOrder, { plugin }),
         h("div", { className: "ns-row ns-row-head" },
             h("div", { className: "ns-row-text" },
                 h("div", { className: "ns-row-name" }, "Keep my real badges"),
@@ -526,6 +733,53 @@ function BadgePicker({ plugin }) {
     );
 }
 
+// The badges exactly as your profile shows them; drag one onto another to move it there.
+function BadgeOrder({ plugin }) {
+    const settings = useSettings(plugin);
+    const userId = plugin.currentUserId;
+    const badges = useStore(UserProfileStore, () => UserProfileStore.getUserProfile(userId)?.badges ?? null);
+    const [dragging, setDragging] = React.useState(null);
+
+    React.useEffect(() => {
+        if (badges == null) Promise.resolve(getFetchProfile()?.(userId)).catch(err => console.error(`[${PLUGIN}]`, err));
+    }, []);
+
+    const move = (from, to) => {
+        if (from === to || !badges) return;
+        const keys = badges.map(badgeKey);
+        const [moved] = keys.splice(from, 1);
+        keys.splice(to, 0, moved);
+        plugin.update({ badgeOrder: keys });
+    };
+
+    return h("div", { className: "ns-order" },
+        h("div", { className: "ns-order-head" },
+            h("div", null,
+                h("div", { className: "ns-row-name" }, "Badge order"),
+                h("div", { className: "ns-row-desc" }, "Drag a badge to move it. This is the order on your profile.")
+            ),
+            settings.badgeOrder && h("button", { className: "ns-button ns-secondary", onClick: () => plugin.update({ badgeOrder: null }) }, "Reset order")
+        ),
+        badges == null
+            ? h("div", { className: "ns-row-desc" }, "Loading your profile…")
+            : h("div", { className: "ns-order-list" },
+                badges.length === 0 && h("div", { className: "ns-row-desc" }, "No badges to order yet."),
+                badges.map((badge, i) => h("div", {
+                    key: badge.id,
+                    className: `ns-order-item ${dragging === i ? "ns-dragging" : ""}`,
+                    draggable: true,
+                    title: badge.description,
+                    onDragStart: e => { setDragging(i); e.dataTransfer.effectAllowed = "move"; },
+                    onDragEnd: () => setDragging(null),
+                    onDragOver: e => e.preventDefault(),
+                    onDrop: e => { e.preventDefault(); if (dragging != null) move(dragging, i); setDragging(null); }
+                },
+                    h("img", { src: badge.iconSrc ?? `https://cdn.discordapp.com/badge-icons/${badge.icon}.png`, alt: badge.description ?? "", draggable: false })
+                ))
+            )
+    );
+}
+
 function EditorSection({ plugin, headingClass }) {
     const settings = useSettings(plugin);
     const slots = [
@@ -533,6 +787,8 @@ function EditorSection({ plugin, headingClass }) {
         { tab: "effect", label: "Effect", value: settings.effect, img: settings.effect?.thumbnail },
         { tab: "nameplate", label: "Nameplate", value: settings.nameplate, img: settings.nameplate && nameplateUrl(settings.nameplate.asset, false) },
         { tab: "frame", label: "Frame", value: settings.frame },
+        { tab: "banner", label: "Banner", value: settings.banner, img: settings.banner?.url },
+        { tab: "nameStyle", label: "Name Style", value: settings.nameStyle },
         { tab: "badges", label: "Badges", value: settings.badges.length ? settings.badges : null }
     ];
 
@@ -548,7 +804,9 @@ function EditorSection({ plugin, headingClass }) {
             },
                 slot.tab === "badges" && slot.value
                     ? h("div", { className: "ns-slot-badges" }, slot.value.slice(0, 4).map(b => h("img", { key: b.badgeId, src: b.profile.iconSrc, alt: "" })))
-                    : slot.img ? h("img", { src: slot.img, alt: "" }) : null,
+                    : slot.tab === "nameStyle" && slot.value
+                        ? h("div", { className: "ns-slot-name" }, h(StyledName, { name: "Aa", style: slot.value }))
+                        : slot.img ? h("img", { className: slot.tab === "banner" ? "ns-slot-banner" : undefined, src: slot.img, alt: "" }) : null,
                 h("span", null, slot.label)
             ))
         )
@@ -596,6 +854,33 @@ const STYLES = `
 .ns-slot:hover { background: var(--background-mod-normal, var(--background-modifier-hover)); color: var(--interactive-hover); }
 .ns-slot.ns-active { border-color: var(--brand-500, #5865f2); }
 .ns-slot > img { max-width: 100%; height: 52px; object-fit: contain; }
+.ns-slot > img.ns-slot-banner { width: 100%; object-fit: cover; border-radius: 4px; }
+.ns-slot-name { font-size: 22px; height: 52px; display: flex; align-items: center; }
+.ns-button { padding: 8px 14px; border-radius: 8px; background: var(--brand-500, #5865f2); color: #fff; font-size: 14px; font-weight: 500; white-space: nowrap; }
+.ns-button:disabled { opacity: .5; cursor: not-allowed; }
+.ns-button.ns-secondary { background: var(--background-mod-normal, var(--background-modifier-accent)); color: var(--interactive-active, var(--text-normal)); }
+.ns-error { color: var(--text-feedback-critical, #f23f43); font-size: 13px; }
+.ns-banner { display: flex; flex-direction: column; gap: 10px; }
+.ns-banner-preview { aspect-ratio: 5 / 2; border-radius: 10px; overflow: hidden; display: flex; align-items: center; justify-content: center; background: var(--background-mod-subtle, var(--background-secondary)); color: var(--text-muted); }
+.ns-banner-preview img { width: 100%; height: 100%; object-fit: cover; }
+.ns-banner-row { display: flex; gap: 8px; align-items: center; }
+.ns-banner-row .ns-search { margin: 0; flex: 1; }
+.ns-namestyle { display: flex; flex-direction: column; gap: 8px; }
+.ns-name-preview { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 16px; border-radius: 10px; background: var(--background-mod-subtle, var(--background-secondary)); font-size: 26px; font-weight: 700; }
+.ns-heading { margin-top: 6px; font-size: 12px; font-weight: 700; text-transform: uppercase; color: var(--text-muted); }
+.ns-chips { display: flex; flex-wrap: wrap; gap: 6px; }
+.ns-chip { padding: 6px 12px; border-radius: 8px; background: var(--background-mod-subtle, var(--background-secondary)); border: 2px solid transparent; color: var(--interactive-normal); font-size: 15px; }
+.ns-chip.ns-active { border-color: var(--brand-500, #5865f2); color: var(--interactive-active, #fff); }
+.ns-swatch { width: 44px; height: 28px; border-radius: 8px; border: 2px solid transparent; }
+.ns-swatch.ns-active { border-color: #fff; box-shadow: 0 0 0 2px var(--brand-500, #5865f2); }
+.ns-color { display: flex; align-items: center; gap: 6px; font-size: 13px; color: var(--text-muted); }
+.ns-color input { width: 36px; height: 28px; padding: 0; border: none; background: none; cursor: pointer; }
+.ns-order { padding: 10px; border-radius: 10px; margin-bottom: 12px; background: var(--background-mod-subtle, var(--background-secondary)); }
+.ns-order-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 8px; }
+.ns-order-list { display: flex; flex-wrap: wrap; gap: 6px; }
+.ns-order-item { width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border-radius: 8px; background: var(--background-mod-normal, var(--background-tertiary)); cursor: grab; }
+.ns-order-item img { width: 24px; height: 24px; object-fit: contain; pointer-events: none; }
+.ns-order-item.ns-dragging { opacity: .4; }
 .ns-slot-badges { display: flex; gap: 2px; }
 .ns-slot-badges img { width: 22px; height: 22px; object-fit: contain; }
 `;
