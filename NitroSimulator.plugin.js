@@ -3,7 +3,7 @@
  * @author ce017
  * @authorLink https://github.com/ce017
  * @description Equip any avatar decoration, profile effect, nameplate, profile frame, banner, display name style and badge (at any level, in any order) on your own profile, straight from Discord's own catalog. Client-side only: nobody else can see it.
- * @version 1.1.0
+ * @version 1.1.1
  * @source https://github.com/ce017/NitroSimulator
  * @updateUrl https://raw.githubusercontent.com/ce017/NitroSimulator/main/NitroSimulator.plugin.js
  */
@@ -733,23 +733,42 @@ function BadgePicker({ plugin }) {
     );
 }
 
-// The badges exactly as your profile shows them; drag one onto another to move it there.
+function reorder(list, from, to) {
+    const next = [...list];
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
+    return next;
+}
+
+// The badges exactly as your profile shows them; drag one to a new spot to move it there.
+// Uses pointer events rather than HTML drag-and-drop, which Discord's own drag handling swallows.
 function BadgeOrder({ plugin }) {
     const settings = useSettings(plugin);
     const userId = plugin.currentUserId;
     const badges = useStore(UserProfileStore, () => UserProfileStore.getUserProfile(userId)?.badges ?? null);
-    const [dragging, setDragging] = React.useState(null);
+    const [drag, setDrag] = React.useState(null); // { from: index in badges, to: position it would land on }
 
     React.useEffect(() => {
         if (badges == null) Promise.resolve(getFetchProfile()?.(userId)).catch(err => console.error(`[${PLUGIN}]`, err));
     }, []);
 
-    const move = (from, to) => {
-        if (from === to || !badges) return;
-        const keys = badges.map(badgeKey);
-        const [moved] = keys.splice(from, 1);
-        keys.splice(to, 0, moved);
-        plugin.update({ badgeOrder: keys });
+    const shown = badges && drag ? reorder(badges, drag.from, drag.to) : badges;
+
+    const onPointerDown = (e, index) => {
+        if (e.button !== 0) return;
+        e.preventDefault();
+        try { e.currentTarget.setPointerCapture(e.pointerId); } catch {}
+        setDrag({ from: index, to: index });
+    };
+    const onPointerMove = e => {
+        if (!drag) return;
+        const target = document.elementFromPoint(e.clientX, e.clientY)?.closest?.(".ns-order-item");
+        const to = target ? Number(target.dataset.position) : NaN;
+        if (!isNaN(to) && to !== drag.to) setDrag({ ...drag, to });
+    };
+    const onPointerUp = () => {
+        if (drag && drag.from !== drag.to) plugin.update({ badgeOrder: reorder(badges, drag.from, drag.to).map(badgeKey) });
+        setDrag(null);
     };
 
     return h("div", { className: "ns-order" },
@@ -764,15 +783,15 @@ function BadgeOrder({ plugin }) {
             ? h("div", { className: "ns-row-desc" }, "Loading your profile…")
             : h("div", { className: "ns-order-list" },
                 badges.length === 0 && h("div", { className: "ns-row-desc" }, "No badges to order yet."),
-                badges.map((badge, i) => h("div", {
+                shown.map((badge, position) => h("div", {
                     key: badge.id,
-                    className: `ns-order-item ${dragging === i ? "ns-dragging" : ""}`,
-                    draggable: true,
+                    "data-position": position,
+                    className: `ns-order-item ${drag && badges[drag.from] === badge ? "ns-dragging" : ""}`,
                     title: badge.description,
-                    onDragStart: e => { setDragging(i); e.dataTransfer.effectAllowed = "move"; },
-                    onDragEnd: () => setDragging(null),
-                    onDragOver: e => e.preventDefault(),
-                    onDrop: e => { e.preventDefault(); if (dragging != null) move(dragging, i); setDragging(null); }
+                    onPointerDown: e => onPointerDown(e, badges.indexOf(badge)),
+                    onPointerMove,
+                    onPointerUp,
+                    onPointerCancel: () => setDrag(null)
                 },
                     h("img", { src: badge.iconSrc ?? `https://cdn.discordapp.com/badge-icons/${badge.icon}.png`, alt: badge.description ?? "", draggable: false })
                 ))
@@ -880,7 +899,8 @@ const STYLES = `
 .ns-order-list { display: flex; flex-wrap: wrap; gap: 6px; }
 .ns-order-item { width: 36px; height: 36px; display: flex; align-items: center; justify-content: center; border-radius: 8px; background: var(--background-mod-normal, var(--background-tertiary)); cursor: grab; }
 .ns-order-item img { width: 24px; height: 24px; object-fit: contain; pointer-events: none; }
-.ns-order-item.ns-dragging { opacity: .4; }
+.ns-order-item { touch-action: none; user-select: none; }
+.ns-order-item.ns-dragging { outline: 2px solid var(--brand-500, #5865f2); cursor: grabbing; opacity: .8; }
 .ns-slot-badges { display: flex; gap: 2px; }
 .ns-slot-badges img { width: 22px; height: 22px; object-fit: contain; }
 `;
